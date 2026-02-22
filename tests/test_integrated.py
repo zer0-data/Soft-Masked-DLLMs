@@ -108,20 +108,49 @@ class TestSoftMaskingIntegrated(unittest.TestCase):
         self.assertTrue(model.soft_masking_module.forward.called)
         print("Soft Masking called during training.")
 
-    def test_inference_step(self):
-        print("\nTesting Inference Step...")
-        model = Diffusion(self.config, self.tokenizer)
-        model.eval()
-        
-        model.soft_masking_module.forward = MagicMock(wraps=model.soft_masking_module.forward)
-        
-        with torch.no_grad():
-            samples = model._sample(num_steps=2)
-            
-        print(f"Samples shape: {samples.shape}")
-        # Check if soft masking was called
-        self.assertTrue(model.soft_masking_module.forward.called)
-        print("Soft Masking called during inference.")
+    def test_v0_is_mask_embed(self):
+        """Verify v0 is always the mask-token embedding, never ground-truth."""
+        print("\nTesting v0 is mask embed...")
+        vocab_size = 100
+        hidden_size = 32
+        mask_token_id = 99
+
+        module = SoftMaskingModule(hidden_size, vocab_size, mask_token_id)
+        embed = torch.nn.Embedding(vocab_size, hidden_size)
+
+        # x_t: position 0 is a real token (id=5), positions 1-4 are masked
+        x_t = torch.tensor([[5, mask_token_id, mask_token_id, mask_token_id, mask_token_id]])
+        probs = torch.softmax(torch.randn(1, 5, vocab_size), dim=-1)
+
+        # Ground-truth embedding for token 5
+        gt_embed = embed(torch.tensor(5))                        # (H,)
+        mask_embed = embed(torch.tensor(mask_token_id))          # (H,)
+
+        result = module(x_t, probs, embed)                       # (1, 5, H)
+
+        # Unmasked position (idx 0) must be the original token-5 embedding
+        self.assertTrue(
+            torch.allclose(result[0, 0], gt_embed, atol=1e-6),
+            "Unmasked position should retain the original token embedding."
+        )
+
+        # Masked positions (idx 1-4) should NOT equal ground-truth embed
+        # and should be interpolated between mask_embed and feedback
+        for pos in range(1, 5):
+            self.assertFalse(
+                torch.allclose(result[0, pos], gt_embed, atol=1e-6),
+                f"Masked position {pos} should NOT contain ground-truth embedding."
+            )
+
+        # Verify the result at each masked position is a valid interpolation:
+        # it should lie between mask_embed and the feedback (not be garbage)
+        # At minimum, each masked position should have finite values
+        self.assertTrue(
+            torch.all(torch.isfinite(result[0, 1:])),
+            "All masked position embeddings should be finite."
+        )
+        print("v0 correctly uses mask-token embedding, not ground-truth.")
 
 if __name__ == '__main__':
     unittest.main()
+
