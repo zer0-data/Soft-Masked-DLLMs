@@ -151,6 +151,59 @@ class TestSoftMaskingIntegrated(unittest.TestCase):
         )
         print("v0 correctly uses mask-token embedding, not ground-truth.")
 
+    def test_raw_probs_not_parameterized(self):
+        """Verify _ddpm_update returns raw (pre-parameterization) probs.
+
+        After the fix, the third return element from _ddpm_update must be
+        a valid softmax distribution from the backbone, NOT the post-
+        parameterization distribution where mask-index is forced to 0.
+        """
+        print("\nTesting raw probs are pre-parameterization...")
+        model = Diffusion(self.config, self.tokenizer)
+        model.eval()
+
+        # Input: all masked tokens
+        x = torch.full((2, 10), model.mask_index, dtype=torch.long)
+        t = 0.5 * torch.ones(2, 1)
+        dt = 0.1
+
+        with torch.no_grad():
+            log_p_x0, x_next, raw_probs = model._ddpm_update(
+                x, t, dt, prev_probs=None)
+
+        # raw_probs must be non-None when soft masking is active
+        self.assertIsNotNone(
+            raw_probs,
+            "raw_probs should be returned when soft masking is enabled.")
+
+        # Must be a valid probability distribution (sums to ~1)
+        sums = raw_probs.sum(dim=-1)
+        self.assertTrue(
+            torch.allclose(sums, torch.ones_like(sums), atol=1e-3),
+            f"raw_probs should sum to 1, got min={sums.min():.4f} max={sums.max():.4f}")
+
+        # KEY CHECK: mask index should have NON-ZERO probability in raw probs.
+        # _subs_parameterization forces mask-index to -inf (prob=0).
+        # If raw_probs has prob>0 at mask index, parameterization was NOT applied.
+        mask_probs = raw_probs[:, :, model.mask_index]
+        self.assertTrue(
+            torch.all(mask_probs > 0),
+            "raw_probs at the mask index should be > 0 (pre-parameterization). "
+            f"Got min={mask_probs.min():.6f}")
+
+        # Verify these probs would pass the SoftMaskingModule input validation
+        # (i.e. they actually sum to 1, not just close to 1 with -inf artifacts)
+        try:
+            model.soft_masking_module(
+                x_t=x,
+                probs=raw_probs,
+                embedding_layer=model._get_embedding_layer()
+            )
+        except ValueError as e:
+            self.fail(f"raw_probs failed SoftMaskingModule validation: {e}")
+
+        print("raw_probs are valid pre-parameterization distributions.")
+
+
 if __name__ == '__main__':
     unittest.main()
-
